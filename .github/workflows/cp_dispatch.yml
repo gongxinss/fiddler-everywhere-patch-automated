@@ -52,9 +52,9 @@ defaults:
     shell: pwsh
 
 env:
-  # 可选：System.Linq.dll 的直链（用于后端签名公钥白名单校验）。
-  # 留空则跳过这一步，补丁仍能打成功，但登录/用户数据可能校验失败。
-  SYSTEM_LINQ_URL: ''
+  # System.Linq.dll 直链（后端签名公钥白名单校验用）
+  # 来源：msojocs/dotnet-runtime-for-fildder（注意仓库名确实是 fildder）
+  SYSTEM_LINQ_URL: 'https://github.com/msojocs/dotnet-runtime-for-fildder/releases/download/v10.0.9-1/System.Linq.dll'
   OS_ARCH: ${{ github.event.inputs.os-and-arch }}
   VERSION_TO_PATCH: ${{ github.event.inputs.version_to_patch }}
   PATCH_SERVER_PORT: ${{ github.event.inputs.patch-server-port }}
@@ -490,9 +490,17 @@ jobs:
             throw "msojocs-patch/server/file 不存在"
           }
 
-          # 关键修复：先把目标目录建出来，再复制内容。
-          # 若目标目录不存在，Copy-Item 会把 file 这层"重命名"掉，
-          # 导致真实路径变成 out/xxx 而不是 out/file/xxx。
+          # 关键修复 1：先把父目录建出来，避免 Copy-Item 在目标不存在时
+          # 把 file 这层"重命名"掉，导致路径变成 out/xxx 而不是 out/file/xxx。
+          $outDir = Split-Path $dst -Parent
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+          # 关键修复 2：官方 fe-tool 是先 RemoveAll(out/file) 再整体放入 server/file，
+          # 属于替换而非合并，避免残留原生页面文件。
+          if (Test-Path $dst) {
+            Remove-Item -Path $dst -Recurse -Force
+            Write-Host "已删除原生 out/file，改为整体替换"
+          }
           New-Item -ItemType Directory -Path $dst -Force | Out-Null
           Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force
 
@@ -565,7 +573,7 @@ jobs:
           Set-Content -Path $source_main -Value $appended_content -Encoding utf8
           Write-Host "main.js patched (index.js 已前置拼接)"
 
-      - name: Patch System.Linq.dll (optional)
+      - name: Patch System.Linq.dll
         continue-on-error: true
         run: |
           $dest = "FE/resources/app/out/WebServer/System.Linq.dll"
