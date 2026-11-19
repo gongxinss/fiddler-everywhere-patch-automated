@@ -1,3 +1,18 @@
+# ============================================================================
+# 修改说明（相对原始版本）
+# 1. patch_fe 的 if: always() 改为精确条件 —— 上游没产出 artifact 就不再往下跑
+# 2. Copy Server Folder 改为「先建目标目录 + 复制内容」，避免 Copy-Item
+#    目标目录不存在时把 file 这一层"吃掉"
+# 3. Set user credentials 增加 Test-Path 断言，失败时打印真实目录结构
+# 4. ConvertTo-Json -Depth 5 改为 -Depth 100，避免深层对象被压成字符串
+# 5. 各关键步骤改为 throw 硬失败，错误停在真正出问题的位置
+# 6. 修正 Mac 分支：runs-on 标签、C++ 注释语法、dmg 文件名、目录未创建
+# 7. 【关键】新增 app.asar 解包步骤 —— 原版完全缺失，导致 8.x 找不到 out/main.js
+# 8. 新增 System.Linq.dll 替换 —— 后端响应签名的公钥白名单校验必需
+#    （地址取自官方 fe-tool 源码 patch.go 的 systemLinqUrl）
+# 9. Copy Server Folder 改为「先删除原生 out/file 再整体替换」，与官方 Apply() 一致
+# ============================================================================
+
 name: Custom Version - Workflow Dispatch
 
 on:
@@ -574,7 +589,6 @@ jobs:
           Write-Host "main.js patched (index.js 已前置拼接)"
 
       - name: Patch System.Linq.dll
-        continue-on-error: true
         run: |
           $dest = "FE/resources/app/out/WebServer/System.Linq.dll"
 
@@ -587,8 +601,17 @@ jobs:
             return
           }
 
-          Invoke-WebRequest -Uri $env:SYSTEM_LINQ_URL -OutFile $dest -Force
-          Write-Host "System.Linq.dll 已替换 -> $dest"
+          # 注意：Invoke-WebRequest 没有 -Force 参数，要覆盖只能先删后下
+          if (Test-Path $dest) { Remove-Item -Path $dest -Force }
+
+          Write-Host "下载 $env:SYSTEM_LINQ_URL"
+          Invoke-WebRequest -Uri $env:SYSTEM_LINQ_URL -OutFile $dest
+
+          $size = (Get-Item $dest).Length
+          if ($size -lt 10000) {
+            throw "System.Linq.dll 只有 $size 字节，疑似下载到了错误页面"
+          }
+          Write-Host "System.Linq.dll 已替换 -> $dest ($size 字节)"
 
       - name: Clean msojocs-patch
         run: |
