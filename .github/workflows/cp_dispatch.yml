@@ -52,6 +52,9 @@ defaults:
     shell: pwsh
 
 env:
+  # 可选：System.Linq.dll 的直链（用于后端签名公钥白名单校验）。
+  # 留空则跳过这一步，补丁仍能打成功，但登录/用户数据可能校验失败。
+  SYSTEM_LINQ_URL: ''
   OS_ARCH: ${{ github.event.inputs.os-and-arch }}
   VERSION_TO_PATCH: ${{ github.event.inputs.version_to_patch }}
   PATCH_SERVER_PORT: ${{ github.event.inputs.patch-server-port }}
@@ -403,6 +406,58 @@ jobs:
           Write-Host "===== FE 顶层结构 ====="
           Get-ChildItem -Path "FE" -Depth 2 | Select-Object FullName
 
+      # 【核心修复】原版 workflow 缺少这一步。
+      # Fiddler Everywhere 的代码打包在 resources/app.asar 里，
+      # 不解包就永远没有 resources/app/out/main.js。
+      - name: Unpack app.asar
+        run: |
+          $resources = "FE/resources"
+          $appDir    = Join-Path $resources "app"
+          $asar      = Join-Path $resources "app.asar"
+          $unpacked  = Join-Path $resources "app.asar.unpacked"
+
+          if (-not (Test-Path $resources)) {
+            Get-ChildItem -Path "FE" -Depth 2 | Select-Object FullName
+            throw "找不到 FE/resources 目录"
+          }
+
+          if (Test-Path $appDir) {
+            Write-Host "resources/app 已存在，跳过解包"
+          }
+          else {
+            if (-not (Test-Path $asar)) {
+              Write-Host "===== resources 实际结构 ====="
+              Get-ChildItem -Path $resources -Depth 2 | Select-Object FullName
+              throw "resources 下既没有 app 目录，也没有 app.asar"
+            }
+
+            # 官方说明：解包前在 app.asar.unpacked 里放一个空的 NOTICES-reporter.txt
+            if (Test-Path $unpacked) {
+              $notice = Join-Path $unpacked "NOTICES-reporter.txt"
+              if (-not (Test-Path $notice)) {
+                New-Item -ItemType File -Path $notice -Force | Out-Null
+              }
+            }
+
+            Write-Host "开始解包 app.asar -> app（视体积可能需要一两分钟）"
+            npx --yes "@electron/asar" extract $asar $appDir
+            if ($LASTEXITCODE -ne 0) {
+              throw "asar extract 失败（退出码 $LASTEXITCODE）。若报路径过长，可尝试在 Linux 任务里解包后再传 artifact"
+            }
+
+            # 解包后必须删掉 asar，否则 Electron 仍会优先加载旧归档
+            Remove-Item -Path $asar -Force
+            Write-Host "app.asar 已删除"
+          }
+
+          $mainJs = Join-Path $appDir "out/main.js"
+          if (-not (Test-Path $mainJs)) {
+            Write-Host "===== app 实际结构 ====="
+            Get-ChildItem -Path $appDir -Depth 2 | Select-Object FullName
+            throw "解包后仍找不到 app/out/main.js"
+          }
+          Write-Host "OK -> $mainJs"
+
       - name: Patch fiddler.dll / libfiddler.dll
         run: |
           $yuiName = "${{ needs.download-Yui-patch.outputs.Yui-fiddler-name }}"
@@ -509,6 +564,23 @@ jobs:
           $appended_content = $index_content + "`n" + $main_content
           Set-Content -Path $source_main -Value $appended_content -Encoding utf8
           Write-Host "main.js patched (index.js 已前置拼接)"
+
+      - name: Patch System.Linq.dll (optional)
+        continue-on-error: true
+        run: |
+          $dest = "FE/resources/app/out/WebServer/System.Linq.dll"
+
+          if ([string]::IsNullOrWhiteSpace($env:SYSTEM_LINQ_URL)) {
+            Write-Host "::warning::SYSTEM_LINQ_URL 未配置，跳过 System.Linq.dll 替换"
+            return
+          }
+          if (-not (Test-Path (Split-Path $dest))) {
+            Write-Host "::warning::WebServer 目录不存在，跳过 System.Linq.dll 替换"
+            return
+          }
+
+          Invoke-WebRequest -Uri $env:SYSTEM_LINQ_URL -OutFile $dest -Force
+          Write-Host "System.Linq.dll 已替换 -> $dest"
 
       - name: Clean msojocs-patch
         run: |
