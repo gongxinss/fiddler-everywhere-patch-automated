@@ -1,3 +1,20 @@
+# ============================================================================
+# Latest Version - Workflow Dispatch（修复版）
+#
+# 与 Custom Version 是同源模板，修复内容一致：
+# 1. 【关键】新增 app.asar 解包 —— 原版完全缺失，8.x 永远找不到 out/main.js
+# 2. Copy Server Folder 改为「先删原生 out/file 再整体替换」，避免
+#    Copy-Item 目标不存在时把 file 这一层"吃掉"
+# 3. Set user credentials 增加断言 + ConvertTo-Json -Depth 100
+# 4. patch_fe 的 if: always() 改为精确条件
+# 5. 新增 System.Linq.dll 替换（后端签名公钥白名单校验必需）
+# 6. 修正 Mac 分支：runs-on 标签、C++ 注释、dmg 文件名、目录未创建
+#
+# 本文件额外修正：
+# 7. inputs.os-and-arch 的 default 原本是 '6.0.0'，不在 options 里，必错
+# 8. Yui_RELEASE 原来只在 >= 5.17.0 时设置，低版本会拼出空路径
+# ============================================================================
+
 name: Latest Version - Workflow Dispatch
 
 on:
@@ -6,13 +23,13 @@ on:
       os-and-arch:
         description: 'Operating System And Architecture'
         required: true
-        default: '6.0.0'
         type: choice
+        default: 'Windows (x86_64)'
         options:
           - Windows (x86_64)
           - Linux (x86_64)
       patch-server-port:
-        description: 'Patch server port (useful for resolving port conflicts)"'
+        description: 'Patch server port (useful for resolving port conflicts)'
         required: true
         default: '5678'
       patch-user-email:
@@ -47,8 +64,11 @@ on:
 defaults:
   run:
     shell: pwsh
-    
+
 env:
+  # System.Linq.dll 直链（后端签名公钥白名单校验用）
+  # 来源：msojocs/dotnet-runtime-for-fildder（注意仓库名确实是 fildder）
+  SYSTEM_LINQ_URL: 'https://github.com/msojocs/dotnet-runtime-for-fildder/releases/download/v10.0.9-1/System.Linq.dll'
   OS_ARCH: ${{ github.event.inputs.os-and-arch }}
   PATCH_SERVER_PORT: ${{ github.event.inputs.patch-server-port }}
   PATCH_USER_EMAIL: ${{ github.event.inputs.patch-user-email }}
@@ -59,35 +79,33 @@ env:
   PATCH_LANGUAGE: ${{ github.event.inputs.patch-language }}
 
 jobs:
+
   init_os_arch:
     runs-on: ubuntu-latest
     outputs:
-      library_extension:  ${{ steps.set_library_extension.outputs.library_extension }}
-      arch_code:  ${{ steps.set_arch.outputs.arch_code }}
+      library_extension: ${{ steps.set_library_extension.outputs.library_extension }}
+      arch_code: ${{ steps.set_arch.outputs.arch_code }}
 
     steps:
       - name: Set Library Extension (dll / so / dylib)
         id: set_library_extension
         run: |
           $extension = 'not-selected'
-    
           if ($env:OS_ARCH -eq 'Windows (x86_64)') {
             $extension = 'dll'
           } elseif ($env:OS_ARCH -eq 'Linux (x86_64)') {
             $extension = 'so'
-          } elseif ($env:OS_ARCH -eq 'Mac (arm64)' -or $env:OS_ARCH -eq 'Mac (arm64e)' -or $env:OS_ARCH -eq 'Mac (x86_64)') {
+          } elseif ($env:OS_ARCH -like 'Mac*') {
             $extension = 'dylib'
           } else {
             throw "Unsupported OS architecture: $env:OS_ARCH"
           }
-          
           "library_extension=$extension" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
 
-      - name: Set Library Extension (dll / so / dylib)
+      - name: Set Arch Code
         id: set_arch
         run: |
           $arch = 'not-selected'
-    
           if ($env:OS_ARCH -eq 'Windows (x86_64)') {
             $arch = 'win32-x86_64'
           } elseif ($env:OS_ARCH -eq 'Linux (x86_64)') {
@@ -101,12 +119,10 @@ jobs:
           } else {
             throw "Unsupported OS architecture: $env:OS_ARCH"
           }
-          
           "arch_code=$arch" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
 
   scrape_fe_version:
     runs-on: ubuntu-latest
-    
     outputs:
       scraped_version: ${{ steps.get_version.outputs.scraped_version }}
 
@@ -117,92 +133,77 @@ jobs:
         id: get_version
         working-directory: utils/fe-version-scraper
         run: ./GetLatest-FEVersion.ps1
-   
+
   download-Yui-patch:
     runs-on: ubuntu-latest
-    needs: 
+    needs:
       - scrape_fe_version
       - init_os_arch
 
-    env: 
+    env:
       SCRAPED_VERSION: ${{ needs.scrape_fe_version.outputs.scraped_version }}
       LIBRARY_EXTENSION: ${{ needs.init_os_arch.outputs.library_extension }}
       ARCH_CODE: ${{ needs.init_os_arch.outputs.arch_code }}
-      
+
     outputs:
-      is-compatible-cont: ${{ steps.is-compatible-cont.outputs.is-compatible-cont }}
       Yui-fiddler-name: ${{ steps.Yui-fiddler-name.outputs.Yui-fiddler-name }}
 
     steps:
       - name: Compare SCRAPED_VERSION with 5.17.0
-        id: scraped_version_check
         run: |
           $scrapedVersion = $env:SCRAPED_VERSION
           $compareVersion = "5.17.0"
-   
           if (-not [string]::IsNullOrEmpty($scrapedVersion)) {
-              if ([version]$scrapedVersion -ge [version]$compareVersion) {
-                  echo "IS_COMPATIBLE_CONT=true" | Out-File -Append -FilePath $env:GITHUB_ENV
-              } else {
-                  echo "IS_COMPATIBLE_CONT=false" | Out-File -Append -FilePath $env:GITHUB_ENV
-              }
+            if ([version]$scrapedVersion -ge [version]$compareVersion) {
+              "IS_COMPATIBLE_CONT=true" | Out-File -Append -FilePath $env:GITHUB_ENV
+            } else {
+              "IS_COMPATIBLE_CONT=false" | Out-File -Append -FilePath $env:GITHUB_ENV
+            }
           } else {
-              echo "IS_COMPATIBLE_CONT=false" | Out-File -Append -FilePath $env:GITHUB_ENV
+            "IS_COMPATIBLE_CONT=false" | Out-File -Append -FilePath $env:GITHUB_ENV
           }
 
-      - name: Set IS_COMPATIBLE_CONT as Output
-        id: is-compatible-cont
-        run: echo "is-compatible-cont=${{ env.IS_COMPATIBLE_CONT }}" >> $env:GITHUB_OUTPUT
-
-      - name: Set Yui name 
-        run: echo "YUI_NAME=yui" >> $env:GITHUB_ENV        
-      
       - name: Set Yui fiddler name (>= 5.17.0)
-        if: env.IS_COMPATIBLE_CONT == 'true'
+        if: env.IS_COMPATIBLE_CONT == 'true' && env.OS_ARCH != 'Linux (x86_64)'
         run: |
-          echo "Yui_FIDDLER_NAME=fiddler.$env:LIBRARY_EXTENSION" >> $env:GITHUB_ENV
-          echo "Yui_FIDDLER_NAME_NO_EXTENSION=fiddler" >> $env:GITHUB_ENV
+          "Yui_FIDDLER_NAME=fiddler.$env:LIBRARY_EXTENSION" | Out-File -Append -FilePath $env:GITHUB_ENV
+          "Yui_FIDDLER_NAME_NO_EXTENSION=fiddler" | Out-File -Append -FilePath $env:GITHUB_ENV
 
       - name: Set Yui fiddler name (< 5.17.0 or on linux)
         if: env.IS_COMPATIBLE_CONT == 'false' || env.OS_ARCH == 'Linux (x86_64)'
         run: |
-          echo "Yui_FIDDLER_NAME=libfiddler.$env:LIBRARY_EXTENSION" >> $env:GITHUB_ENV
-          echo "Yui_FIDDLER_NAME_NO_EXTENSION=libfiddler" >> $env:GITHUB_ENV
-      
+          "Yui_FIDDLER_NAME=libfiddler.$env:LIBRARY_EXTENSION" | Out-File -Append -FilePath $env:GITHUB_ENV
+          "Yui_FIDDLER_NAME_NO_EXTENSION=libfiddler" | Out-File -Append -FilePath $env:GITHUB_ENV
+
       - name: Set Yui_FIDDLER_NAME as Output
         id: Yui-fiddler-name
-        run: echo "Yui-fiddler-name=${{ env.Yui_FIDDLER_NAME }}" >> $env:GITHUB_OUTPUT
+        run: |
+          "Yui-fiddler-name=$env:Yui_FIDDLER_NAME" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
 
       - name: Create Yui directory
         run: |
-          if (-Not (Test-Path "Yui")) {
-            New-Item -ItemType Directory -Path "Yui"
+          if (-not (Test-Path "Yui")) {
+            New-Item -ItemType Directory -Path "Yui" -Force | Out-Null
           }
 
-      - name: Set Yui Release
-        if: env.IS_COMPATIBLE_CONT == 'true' 
-        run: echo "Yui_RELEASE=continuous" >> $env:GITHUB_ENV
-        
       - name: Download Yui Patch
         run: |
-          Write-Host "EXTENSION = $env:LIBRARY_EXTENSION"
-          Write-Host "ARCH CODE =  $env:ARCH_CODE"
-          try {
-            # Build the download URLs
-            $YuiFiddlerUrl = "https://github.com/project-yui/Yui-patch/releases/download/$env:Yui_RELEASE/$env:YUI_NAME-$env:Yui_FIDDLER_NAME_NO_EXTENSION-$env:ARCH_CODE-$env:Yui_RELEASE.$env:LIBRARY_EXTENSION"
-            
-            # Print the URLs to ensure they're correct
-            Write-Host "Downloading files from $env:Yui_RELEASE"
-            Write-Host "Yui Fiddler URL: $YuiFiddlerUrl"
+          $yuiName = "yui"
+          # 原来只在 >= 5.17.0 时设置 release，低版本会拼出空路径，这里统一给值
+          $release = "continuous"
+          $fileName = "$yuiName-$env:Yui_FIDDLER_NAME_NO_EXTENSION-$env:ARCH_CODE-$release.$env:LIBRARY_EXTENSION"
+          $YuiFiddlerUrl = "https://github.com/project-yui/Yui-patch/releases/download/$release/$fileName"
 
-            # Download the files
-            Invoke-WebRequest -Uri $YuiFiddlerUrl -OutFile "Yui\$env:Yui_FIDDLER_NAME"
+          Write-Host "EXTENSION   = $env:LIBRARY_EXTENSION"
+          Write-Host "ARCH CODE   = $env:ARCH_CODE"
+          Write-Host "Download URL: $YuiFiddlerUrl"
+
+          try {
+            Invoke-WebRequest -Uri $YuiFiddlerUrl -OutFile "Yui/$env:Yui_FIDDLER_NAME"
+          } catch {
+            throw "下载 Yui patch 失败: $YuiFiddlerUrl`n$_"
           }
-          catch {
-            Write-Error "Failed to download the patch files. Error details: $_"
-            exit 1
-          }
-      
+
       - name: Upload Yui folder as an artifact
         uses: actions/upload-artifact@v7
         with:
@@ -227,11 +228,12 @@ jobs:
 
       - name: Move the downloaded directory to the target folder
         run: |
-          New-Item -ItemType Directory -Path "msojocs" -Force
+          New-Item -ItemType Directory -Path "msojocs" -Force | Out-Null
+          if (-not (Test-Path "server")) { throw "sparse-checkout 没有产出 server 目录" }
           Move-Item -Path "server" -Destination "msojocs/"
 
       - name: List files in the msojocs/server directory
-        run: Get-ChildItem -Path msojocs\server
+        run: Get-ChildItem -Path msojocs\server -Depth 1
 
       - name: Upload msojocs folder as an artifact
         uses: actions/upload-artifact@v7
@@ -243,34 +245,35 @@ jobs:
   download-fiddler-everywhere-windows:
     if: ${{ github.event.inputs.os-and-arch == 'Windows (x86_64)' }}
     runs-on: ubuntu-latest
-    needs: 
+    needs:
       - scrape_fe_version
 
     steps:
       - name: Build URL & Download
         run: |
-          # Retrieve the scraped version from the previous step
           $scrapedVersion = "${{ needs.scrape_fe_version.outputs.scraped_version }}"
-          
-          # Check if the scraped version is available
-          if (-not [string]::IsNullOrEmpty($scrapedVersion)) {
-            $downloadUrl = "https://downloads.getfiddler.com/win/Fiddler%20Everywhere%20$scrapedVersion.exe"
-          
-            Write-Host "Download URL: $downloadUrl"
+          if ([string]::IsNullOrEmpty($scrapedVersion)) { throw "SCRAPED_VERSION 为空" }
 
-            Invoke-WebRequest -Uri $downloadUrl -OutFile "FiddlerEverywhereSetup.exe"
-            
-          } else {
-            Write-Host "SCRAPED_VERSION is empty or not set"
-            exit 1
-          }
+          $downloadUrl = "https://downloads.getfiddler.com/win/Fiddler%20Everywhere%20$scrapedVersion.exe"
+          Write-Host "Download URL: $downloadUrl"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile "FiddlerEverywhereSetup.exe"
+          Write-Host "安装包大小: $((Get-Item 'FiddlerEverywhereSetup.exe').Length) 字节"
 
-      - name: Extract exe 
+      - name: Extract exe
         run: 7z x "FiddlerEverywhereSetup.exe" -ofe_extracted
 
       - name: Extract app
-        run: 7z x "fe_extracted/`$PLUGINSDIR/app-64.7z" -ofe_app
-        
+        run: |
+          $archives = Get-ChildItem -Path "fe_extracted" -Recurse -Filter "app-*.7z"
+          if (-not $archives) {
+            Get-ChildItem -Path "fe_extracted" -Depth 2 | Select-Object FullName
+            throw "fe_extracted 里找不到 app-*.7z"
+          }
+          $archive = $archives | Where-Object { $_.Name -eq "app-64.7z" } | Select-Object -First 1
+          if (-not $archive) { $archive = $archives[0] }
+          Write-Host "使用归档: $($archive.FullName)"
+          7z x $archive.FullName -ofe_app
+
       - name: Upload Fiddler Everywhere Extracted folder as an artifact
         uses: actions/upload-artifact@v7
         with:
@@ -281,36 +284,27 @@ jobs:
   download-fiddler-everywhere-linux:
     if: ${{ github.event.inputs.os-and-arch == 'Linux (x86_64)' }}
     runs-on: ubuntu-latest
-    needs: 
+    needs:
       - scrape_fe_version
 
     steps:
       - name: Build URL & Download
         run: |
-          # Retrieve the scraped version from the previous step
           $scrapedVersion = "${{ needs.scrape_fe_version.outputs.scraped_version }}"
-          
-          # Check if the scraped version is available
-          if (-not [string]::IsNullOrEmpty($scrapedVersion)) {
-            $downloadUrl = "https://downloads.getfiddler.com/linux/fiddler-everywhere-$scrapedVersion.AppImage"
-          
-            Write-Host "Download URL: $downloadUrl"
+          if ([string]::IsNullOrEmpty($scrapedVersion)) { throw "SCRAPED_VERSION 为空" }
 
-            Invoke-WebRequest -Uri $downloadUrl -OutFile "FiddlerEverywhereSetup.AppImage"
-            
-          } else {
-            Write-Host "SCRAPED_VERSION is empty or not set"
-            exit 1
-          }
+          $downloadUrl = "https://downloads.getfiddler.com/linux/fiddler-everywhere-$scrapedVersion.AppImage"
+          Write-Host "Download URL: $downloadUrl"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile "FiddlerEverywhereSetup.AppImage"
 
-      - name: Extract AppImage 
+      - name: Extract AppImage
         run: |
           chmod +x ./FiddlerEverywhereSetup.AppImage
           ./FiddlerEverywhereSetup.AppImage --appimage-extract
 
       - name: Rename squashfs-root to fe_app
         run: mv squashfs-root fe_app
-        
+
       - name: Upload Fiddler Everywhere Extracted folder as an artifact
         uses: actions/upload-artifact@v7
         with:
@@ -320,50 +314,43 @@ jobs:
 
   download-fiddler-everywhere-mac:
     if: ${{ github.event.inputs.os-and-arch == 'Mac (x86_64)' || github.event.inputs.os-and-arch == 'Mac (arm64)' || github.event.inputs.os-and-arch == 'Mac (arm64e)' }}
-    runs-on: mac-latest
-    needs: 
+    runs-on: macos-latest
+    needs:
       - scrape_fe_version
+      - init_os_arch
 
-    env: 
-      ARCH_CODE: ${{ github.event.inputs.arch_code }}
+    env:
+      ARCH_CODE: ${{ needs.init_os_arch.outputs.arch_code }}
 
     steps:
       - name: Build URL & Download
         run: |
-          # Retrieve the scraped version from the previous step
           $scrapedVersion = "${{ needs.scrape_fe_version.outputs.scraped_version }}"
-          
-          # Check if the scraped version is available
-          if (-not [string]::IsNullOrEmpty($scrapedVersion)) {
-            $downloadUrl = "null"
+          if ([string]::IsNullOrEmpty($scrapedVersion)) { throw "SCRAPED_VERSION 为空" }
 
-            if ($env:ARCH_CODE -eq "x86_64") {
-              $downloadUrl = "https://downloads.getfiddler.com/mac/Fiddler%20Everywhere%20$scrapedVersion.dmg"
-            } elseif ($env:ARCH_CODE -eq "arm64") {
-              $downloadUrl = "https://downloads.getfiddler.com/mac-arm64/Fiddler%20Everywhere%20$scrapedVersion.dmg"
-            } elseif ($env:ARCH_CODE -eq "arm64e") {
-              //Don't know
-            } else {
-              throw "Unsupported OS architecture: $env:ARCH_CODE"
-            }
-          
-            Write-Host "Download URL: $downloadUrl"
-
-            Invoke-WebRequest -Uri $downloadUrl -OutFile "FiddlerEverywhereSetup.dmg"
-            
+          if ($env:ARCH_CODE -eq "mac-x86_64") {
+            $downloadUrl = "https://downloads.getfiddler.com/mac/Fiddler%20Everywhere%20$scrapedVersion.dmg"
+          } elseif ($env:ARCH_CODE -eq "mac-arm64") {
+            $downloadUrl = "https://downloads.getfiddler.com/mac-arm64/Fiddler%20Everywhere%20$scrapedVersion.dmg"
           } else {
-            Write-Host "SCRAPED_VERSION is empty or not set"
-            exit 1
+            throw "不支持的 macOS 架构: $env:ARCH_CODE"
           }
 
-      - name: Extract Dmg 
+          Write-Host "Download URL: $downloadUrl"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile "FiddlerEverywhereSetup.dmg"
+
+      - name: Mount and extract dmg
         run: |
-          hdiutil attach FiddlerEverywhere.dmg
-          cp -R /Volumes/FiddlerEverywhere/* ./fe_app/
+          hdiutil attach FiddlerEverywhereSetup.dmg
+          New-Item -ItemType Directory -Path "fe_app" -Force | Out-Null
+          $volume = Get-ChildItem -Path "/Volumes" -Filter "Fiddler*" -Directory | Select-Object -First 1
+          if (-not $volume) { throw "找不到挂载的 Fiddler 卷" }
+          Copy-Item -Path (Join-Path $volume.FullName '*') -Destination "fe_app" -Recurse -Force
+          hdiutil detach $volume.FullName -Force
 
       - name: List fe_app
-        run: Get-ChildItem -Recurse
-        
+        run: Get-ChildItem -Recurse fe_app -Depth 2
+
       - name: Upload Fiddler Everywhere Extracted folder as an artifact
         uses: actions/upload-artifact@v7
         with:
@@ -375,28 +362,39 @@ jobs:
     runs-on: windows-latest
 
     needs:
+      - scrape_fe_version
       - download-Yui-patch
       - download-msojocs-server
-      - scrape_fe_version
       - download-fiddler-everywhere-windows
       - download-fiddler-everywhere-linux
       - download-fiddler-everywhere-mac
-    if: always()
+
+    # 只有前置任务真的成功了才打补丁。
+    # 原来的 if: always() 会让这一步在上游全挂时照样执行，
+    # 于是真实的失败原因被掩盖，最后在一个莫名其妙的地方报错。
+    if: ${{ !cancelled() && needs.scrape_fe_version.result == 'success' && needs.download-Yui-patch.result == 'success' && needs.download-msojocs-server.result == 'success' && (needs.download-fiddler-everywhere-windows.result == 'success' || needs.download-fiddler-everywhere-linux.result == 'success' || needs.download-fiddler-everywhere-mac.result == 'success') }}
 
     env:
       SCRAPED_VERSION: ${{ needs.scrape_fe_version.outputs.scraped_version }}
 
     outputs:
       patched-fe-name: ${{ steps.rename-fe.outputs.patched-fe-name }}
-      
+
     steps:
-      - name: Download Yukuhana-Patch
+      - name: Verify scraped version
+        run: |
+          Write-Host "SCRAPED_VERSION = $env:SCRAPED_VERSION"
+          if ([string]::IsNullOrWhiteSpace($env:SCRAPED_VERSION)) {
+            throw "scraped_version 为空，检查 scrape_fe_version 的输出"
+          }
+
+      - name: Download Yui Patch
         uses: actions/download-artifact@v8
         with:
           name: Yui-patch
           path: Yui-patch
 
-      - name: Download msojocs-Server
+      - name: Download msojocs Server
         uses: actions/download-artifact@v8
         with:
           name: msojocs-patch
@@ -410,50 +408,134 @@ jobs:
 
       - name: List the contents of the downloaded artifacts
         run: |
-          Get-ChildItem -Recurse Yui-patch
-          Get-ChildItem -Recurse msojocs-patch
-          Get-ChildItem -Recurse fe_app
+          Write-Host "===== Yui-patch ====="
+          Get-ChildItem -Path Yui-patch -Depth 2 | Select-Object FullName
+          Write-Host "===== msojocs-patch ====="
+          Get-ChildItem -Path msojocs-patch -Depth 3 | Select-Object FullName
+          Write-Host "===== fe_app ====="
+          Get-ChildItem -Path fe_app -Depth 2 | Select-Object FullName
 
       - name: Rename main FE folder
-        run: Rename-Item -Path "fe_app" -NewName "FE"
+        run: |
+          if (-not (Test-Path "fe_app")) {
+            Get-ChildItem -Path . -Depth 2 | Select-Object FullName
+            throw "fe_app 目录不存在：前置的下载/解包 job 没有产出 artifact"
+          }
+          Rename-Item -Path "fe_app" -NewName "FE"
+          Write-Host "===== FE 顶层结构 ====="
+          Get-ChildItem -Path "FE" -Depth 2 | Select-Object FullName
+
+      # 【核心修复】原版 workflow 缺少这一步。
+      # Fiddler Everywhere 的代码打包在 resources/app.asar 里，
+      # 不解包就永远没有 resources/app/out/main.js。
+      - name: Unpack app.asar
+        run: |
+          $resources = "FE/resources"
+          $appDir    = Join-Path $resources "app"
+          $asar      = Join-Path $resources "app.asar"
+          $unpacked  = Join-Path $resources "app.asar.unpacked"
+
+          if (-not (Test-Path $resources)) {
+            Get-ChildItem -Path "FE" -Depth 2 | Select-Object FullName
+            throw "找不到 FE/resources 目录"
+          }
+
+          if (Test-Path $appDir) {
+            Write-Host "resources/app 已存在，跳过解包"
+          }
+          else {
+            if (-not (Test-Path $asar)) {
+              Write-Host "===== resources 实际结构 ====="
+              Get-ChildItem -Path $resources -Depth 2 | Select-Object FullName
+              throw "resources 下既没有 app 目录，也没有 app.asar"
+            }
+
+            # 官方说明：解包前在 app.asar.unpacked 里放一个空的 NOTICES-reporter.txt
+            if (Test-Path $unpacked) {
+              $notice = Join-Path $unpacked "NOTICES-reporter.txt"
+              if (-not (Test-Path $notice)) {
+                New-Item -ItemType File -Path $notice -Force | Out-Null
+              }
+            }
+
+            Write-Host "开始解包 app.asar -> app（视体积可能需要一两分钟）"
+            npx --yes "@electron/asar" extract $asar $appDir
+            if ($LASTEXITCODE -ne 0) {
+              throw "asar extract 失败（退出码 $LASTEXITCODE）。若报路径过长，可尝试在 Linux 任务里解包后再传 artifact"
+            }
+
+            # 解包后必须删掉 asar，否则 Electron 仍会优先加载旧归档
+            Remove-Item -Path $asar -Force
+            Write-Host "app.asar 已删除"
+          }
+
+          $mainJs = Join-Path $appDir "out/main.js"
+          if (-not (Test-Path $mainJs)) {
+            Write-Host "===== app 实际结构 ====="
+            Get-ChildItem -Path $appDir -Depth 2 | Select-Object FullName
+            throw "解包后仍找不到 app/out/main.js"
+          }
+          Write-Host "OK -> $mainJs"
 
       - name: Patch fiddler.dll / libfiddler.dll
         run: |
-          $original_fiddler = "FE/${{ needs.download-Yui-patch.outputs.Yui-fiddler-name }}"
-          $Yui_fiddler = "Yui-patch/${{ needs.download-Yui-patch.outputs.Yui-fiddler-name }}"
-          
+          $yuiName = "${{ needs.download-Yui-patch.outputs.Yui-fiddler-name }}"
+          if ([string]::IsNullOrEmpty($yuiName)) {
+            throw "Yui-fiddler-name 为空，检查 download-Yui-patch 的输出"
+          }
+
+          $original_fiddler = "FE/$yuiName"
+          $Yui_fiddler = "Yui-patch/$yuiName"
+
           if ((Test-Path $original_fiddler) -and (Test-Path $Yui_fiddler)) {
             Copy-Item -Path $Yui_fiddler -Destination $original_fiddler -Force
             Write-Host "Replaced $original_fiddler with $Yui_fiddler"
           } else {
-            Write-Host "fiddler / libfiddler or Yui patch not found"
+            Write-Host "未找到 $original_fiddler 或 $Yui_fiddler，跳过库替换"
           }
 
       - name: Clean Yui-patch
         run: |
-          if (Test-Path Yui-patch) {
-            Remove-Item -Path "Yui-patch" -Recurse
-          } else {
-            Write-Host "Yui-patch Folder not found"
-          }
+          if (Test-Path "Yui-patch") { Remove-Item -Path "Yui-patch" -Recurse -Force }
 
       - name: Copy Server Folder
         run: |
-          $source_server_folder = "msojocs-patch/server/file"
-          $destination_server_folder = "FE/resources/app/out"
+          $src = "msojocs-patch/server/file"
+          $dst = "FE/resources/app/out/file"
 
-          if (Test-Path $source_server_folder) {
-            Copy-Item -Path $source_server_folder -Destination $destination_server_folder -Recurse
-          } else {
-            Write-Host "Source Server Folder not found"
+          if (-not (Test-Path $src)) {
+            Write-Host "===== msojocs-patch 实际结构 ====="
+            Get-ChildItem -Path "msojocs-patch" -Depth 3 | Select-Object FullName
+            throw "msojocs-patch/server/file 不存在"
           }
+
+          # 关键修复 1：先把父目录建出来，避免 Copy-Item 在目标不存在时
+          # 把 file 这层"重命名"掉，导致路径变成 out/xxx 而不是 out/file/xxx。
+          $outDir = Split-Path $dst -Parent
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+          # 关键修复 2：官方 fe-tool 是先 RemoveAll(out/file) 再整体放入 server/file，
+          # 属于替换而非合并，避免残留原生页面文件。
+          if (Test-Path $dst) {
+            Remove-Item -Path $dst -Recurse -Force
+            Write-Host "已删除原生 out/file，改为整体替换"
+          }
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force
+
+          $probe = Join-Path $dst 'identity.getfiddler.com/oauth/token.json'
+          if (-not (Test-Path $probe)) {
+            Write-Host "===== FE/resources/app/out 实际结构 ====="
+            Get-ChildItem -Path "FE/resources/app/out" -Depth 3 | Select-Object FullName
+            throw "复制完成后仍找不到 token.json"
+          }
+          Write-Host "OK -> $probe"
 
       - name: Enable Chinese translation
         if: startsWith(env.PATCH_LANGUAGE, 'Yes')
         run: |
           $translate_js = "msojocs-patch/server/translate.js"
           $dest_translate = "FE/resources/app/out/translate.js"
-
           if (Test-Path $translate_js) {
             Copy-Item -Path $translate_js -Destination $dest_translate -Force
             Write-Host "translate.js copied, Chinese language enabled (Ctrl+T to switch)"
@@ -461,72 +543,94 @@ jobs:
             Write-Host "translate.js not found in server directory"
           }
 
-      - name: Set patch server port (in main.js of server)
+      - name: Set patch server port (index.js)
         run: |
           $source_index = "msojocs-patch/server/index.js"
-          $index_content = Get-Content -Path $source_index -Raw
+          if (-not (Test-Path $source_index)) { throw "index.js 不存在: $source_index" }
 
-          if (Test-Path $source_index) {
-            $index_content = $index_content -replace 'const port = \d+;', "const port = $env:PATCH_SERVER_PORT;"
-            Set-Content -Path $source_index -Value $index_content
-            Write-Host "Server port set to $env:PATCH_SERVER_PORT"
-          } else {
-            Write-Host "index.js (from server) not found"
-          }
+          $index_content = Get-Content -Path $source_index -Raw
+          $index_content = $index_content -replace 'const port = \d+;', "const port = $env:PATCH_SERVER_PORT;"
+          Set-Content -Path $source_index -Value $index_content -Encoding utf8
+          Write-Host "Server port set to $env:PATCH_SERVER_PORT"
 
       - name: Set user credentials
         run: |
           $source_json = "FE/resources/app/out/file/identity.getfiddler.com/oauth/token.json"
-          $main_content = Get-Content -Path $source_json -Raw | ConvertFrom-Json
 
+          if (-not (Test-Path $source_json)) {
+            Write-Host "===== FE/resources/app/out 实际结构 ====="
+            Get-ChildItem -Path "FE/resources/app/out" -Depth 3 | Select-Object FullName
+            throw "token.json 不存在: $source_json"
+          }
+
+          $main_content = Get-Content -Path $source_json -Raw | ConvertFrom-Json
           $main_content.user_info.email = $env:PATCH_USER_EMAIL
           $main_content.user_info.firstName = $env:PATCH_USER_FNAME
           $main_content.user_info.lastName = $env:PATCH_USER_LNAME
           $main_content.user_info.country = $env:PATCH_USER_COUNTRYCODE
           $main_content.user_info.identities[0].providerName = $env:PATCH_USER_PROVIDER
 
-          $main_content | ConvertTo-Json -Depth 5 | Set-Content -Path $source_json
+          # Depth 必须够大，否则超出层级的嵌套对象会被压成 "@{...}" 字符串
+          $main_content | ConvertTo-Json -Depth 100 | Set-Content -Path $source_json -Encoding utf8
+          Write-Host "Credentials patched -> $source_json"
 
       - name: Patch main.js to main.original.js
         run: |
           $source_main = "FE/resources/app/out/main.js"
-          $main_content = Get-Content -Path $source_main -Raw
-
           $new_main = "FE/resources/app/out/main.original.js"
-
           $source_index = "msojocs-patch/server/index.js"
+
+          if (-not (Test-Path $source_main)) { throw "main.js 不存在: $source_main" }
+          if (-not (Test-Path $source_index)) { throw "index.js 不存在: $source_index" }
+
+          Copy-Item -Path $source_main -Destination $new_main -Force
+
+          $main_content = Get-Content -Path $source_main -Raw
           $index_content = Get-Content -Path $source_index -Raw
-          
-          if ((Test-Path $source_main) -and (Test-Path $source_index)) {
-            Copy-Item -Path $source_main -Destination $new_main
 
-            $appended_content = $index_content + $main_content
+          $appended_content = $index_content + "`n" + $main_content
+          Set-Content -Path $source_main -Value $appended_content -Encoding utf8
+          Write-Host "main.js patched (index.js 已前置拼接)"
 
-            Set-Content -Path $source_main -Value $appended_content
-          } else {
-            Write-Host "Source main.js or index.js (from server) not found"
+      - name: Patch System.Linq.dll
+        run: |
+          $dest = "FE/resources/app/out/WebServer/System.Linq.dll"
+
+          if ([string]::IsNullOrWhiteSpace($env:SYSTEM_LINQ_URL)) {
+            Write-Host "::warning::SYSTEM_LINQ_URL 未配置，跳过 System.Linq.dll 替换"
+            return
           }
+          if (-not (Test-Path (Split-Path $dest))) {
+            Write-Host "::warning::WebServer 目录不存在，跳过 System.Linq.dll 替换"
+            return
+          }
+
+          # 注意：Invoke-WebRequest 没有 -Force 参数，要覆盖只能先删后下
+          if (Test-Path $dest) { Remove-Item -Path $dest -Force }
+
+          Write-Host "下载 $env:SYSTEM_LINQ_URL"
+          Invoke-WebRequest -Uri $env:SYSTEM_LINQ_URL -OutFile $dest
+
+          $size = (Get-Item $dest).Length
+          if ($size -lt 10000) {
+            throw "System.Linq.dll 只有 $size 字节，疑似下载到了错误页面"
+          }
+          Write-Host "System.Linq.dll 已替换 -> $dest ($size 字节)"
 
       - name: Clean msojocs-patch
         run: |
-          if (Test-Path msojocs-patch) {
-            Remove-Item -Path "msojocs-patch" -Recurse
-          } else {
-            Write-Host "msojocs-patch Folder not found"
-          }
+          if (Test-Path "msojocs-patch") { Remove-Item -Path "msojocs-patch" -Recurse -Force }
 
-      - name: Rename FE 
+      - name: Rename FE
         id: rename-fe
         run: |
-          if (Test-Path FE) {
-            $newName = "Fiddler-Everywhere-V$env:SCRAPED_VERSION-Patched"
-            
-            Rename-Item -Path "FE" -NewName $newName
-            
-            echo "patched-fe-name=$newName" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "FE Folder not found!?"
-          }
+          if (-not (Test-Path "FE")) { throw "FE 目录不存在，无法重命名" }
+
+          $newName = "Fiddler-Everywhere-V${env:SCRAPED_VERSION}-Patched"
+          Rename-Item -Path "FE" -NewName $newName
+
+          "patched-fe-name=$newName" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          Write-Host "Renamed to $newName"
 
       - name: Upload Artifact for Patched FE
         uses: actions/upload-artifact@v7
